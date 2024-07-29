@@ -1,0 +1,150 @@
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <curand.h>
+#include <curand_kernel.h>
+#include <vector>
+#include <cmath>
+#include <iostream>
+
+// CUDA kernel for initializing weights and biases
+__global__ void initializeWeightsAndBiases(float* weights, float* biases, int rows, int cols, unsigned long long seed) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < rows * cols) {
+        curandState state;
+        curand_init(seed, idx, 0, &state);
+        weights[idx] = curand_uniform(&state) - 0.5f;
+    }
+    if (idx < rows) {
+        biases[idx] = 0.0f;
+    }
+}
+
+// CUDA kernel for forward propagation
+__global__ void forwardPropagation(float* input, float* weights, float* biases, float* output, int inputSize, int outputSize) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < outputSize) {
+        float sum = 0.0f;
+        for (int i = 0; i < inputSize; ++i) {
+            sum += weights[idx * inputSize + i] * input[i];
+        }
+        sum += biases[idx];
+        output[idx] = 1.0f / (1.0f + expf(-sum)); // Sigmoid activation
+    }
+}
+
+// CUDA kernel for backward propagation
+__global__ void backwardPropagation(float* input, float* weights, float* biases, float* output, float* target, float* gradients, float learning_rate, int inputSize, int outputSize) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < outputSize) {
+        float error = output[idx] - target[idx];
+        float gradient = error * output[idx] * (1.0f - output[idx]);
+        gradients[idx] = gradient;
+        
+        for (int i = 0; i < inputSize; ++i) {
+            atomicAdd(&weights[idx * inputSize + i], -learning_rate * gradient * input[i]);
+        }
+        atomicAdd(&biases[idx], -learning_rate * gradient);
+    }
+}
+
+class CudaNeuralNetwork {
+private:
+    std::vector<int> layer_sizes;
+    std::vector<float*> d_weights;
+    std::vector<float*> d_biases;
+    std::vector<float*> d_activations;
+    std::vector<float*> d_z_values;
+
+public:
+    CudaNeuralNetwork(const std::vector<int>& layer_sizes) : layer_sizes(layer_sizes) {
+        for (size_t i = 1; i < layer_sizes.size(); ++i) {
+            int rows = layer_sizes[i];
+            int cols = layer_sizes[i - 1];
+            
+            float* d_layer_weights;
+            float* d_layer_biases;
+            cudaMalloc(&d_layer_weights, rows * cols * sizeof(float));
+            cudaMalloc(&d_layer_biases, rows * sizeof(float));
+            
+            int block_size = 256;
+            int grid_size = (rows * cols + block_size - 1) / block_size;
+            initializeWeightsAndBiases<<<grid_size, block_size>>>(d_layer_weights, d_layer_biases, rows, cols, time(NULL));
+            
+            d_weights.push_back(d_layer_weights);
+            d_biases.push_back(d_layer_biases);
+            
+            float* d_activation;
+            cudaMalloc(&d_activation, rows * sizeof(float));
+            d_activations.push_back(d_activation);
+            
+            float* d_z_value;
+            cudaMalloc(&d_z_value, rows * sizeof(float));
+            d_z_values.push_back(d_z_value);
+        }
+    }
+    
+    ~CudaNeuralNetwork() {
+        for (auto& d_weight : d_weights) {
+            cudaFree(d_weight);
+        }
+        for (auto& d_bias : d_biases) {
+            cudaFree(d_bias);
+        }
+        for (auto& d_activation : d_activations) {
+            cudaFree(d_activation);
+        }
+        for (auto& d_z_value : d_z_values) {
+            cudaFree(d_z_value);
+        }
+    }
+    
+    std::vector<float> forward(const std::vector<float>& input) {
+        float* d_input;
+        cudaMalloc(&d_input, input.size() * sizeof(float));
+        cudaMemcpy(d_input, input.data(), input.size() * sizeof(float), cudaMemcpyHostToDevice);
+        
+        for (size_t i = 0; i < d_weights.size(); ++i) {
+            int block_size = 256;
+            int grid_size = (layer_sizes[i + 1] + block_size - 1) / block_size;
+            forwardPropagation<<<grid_size, block_size>>>(d_input, d_weights[i], d_biases[i], d_activations[i], layer_sizes[i], layer_sizes[i + 1]);
+            d_input = d_activations[i];
+        }
+        
+        std::vector<float> output(layer_sizes.back());
+        cudaMemcpy(output.data(), d_activations.back(), output.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        return output;
+    }
+    
+    void backward(const std::vector<float>& input, const std::vector<float>& target, float learning_rate) {
+        float* d_input;
+        cudaMalloc(&d_input, input.size() * sizeof(float));
+        cudaMemcpy(d_input, input.data(), input.size() * sizeof(float), cudaMemcpyHostToDevice);
+        
+        float* d_target;
+        cudaMalloc(&d_target, target.size() * sizeof(float));
+        cudaMemcpy(d_target, target.data(), target.size() * sizeof(float), cudaMemcpyHostToDevice);
+        
+        std::vector<float*> d_gradients(d_weights.size());
+        for (size_t i = 0; i < d_weights.size(); ++i) {
+            cudaMalloc(&d_gradients[i], layer_sizes[i + 1] * sizeof(float));
+        }
+        
+        for (int i = d_weights.size() - 1; i >= 0; --i) {
+            int block_size = 256;
+            int grid_size = (layer_sizes[i + 1] + block_size - 1) / block_size;
+            backwardPropagation<<<grid_size, block_size>>>(d_input, d_weights[i], d_biases[i], d_activations[i], d_target, d_gradients[i], learning_rate, layer_sizes[i], layer_sizes[i + 1]);
+            
+            if (i > 0) {
+                // Compute gradients for the previous layer
+                // This part is simplified and may need to be expanded for a full implementation
+                d_target = d_gradients[i];
+            }
+        }
+        
+        for (auto& d_gradient : d_gradients) {
+            cudaFree(d_gradient);
+        }
+        cudaFree(d_input);
+        cudaFree(d_target);
+    }
+};

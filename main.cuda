@@ -1,0 +1,146 @@
+#include <opencv2/opencv.hpp>
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include "cifar10_loader.h"
+#include "CudaNeuralNetwork.h"  // We'll need to create this header
+#include "preprocess.h"
+#include <thrust/device_vector.h>
+
+#define NUM_DATA 5
+#define TEST_PATH "yolo.cpp/dataset/test_batch.bin"
+#define LEARNING_RATE 0.5f
+#define NUM_EPOCHS 1000
+#define BATCH_SIZE 64
+
+// CUDA kernel for one-hot encoding
+__global__ void oneHotEncode(float* target, int* labels, int num_classes, int batch_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size) {
+        for (int i = 0; i < num_classes; i++) {
+            target[idx * num_classes + i] = (i == labels[idx]) ? 1.0f : 0.0f;
+        }
+    }
+}
+
+int main() {
+    // Loading the dataset (same as before)
+    std::vector<CIFAR10Image> combined_dataset;
+    for(int i = 0; i < NUM_DATA; i++){
+        std::string data_path = "yolo.cpp/dataset/data_batch_" + std::to_string(i + 1) + ".bin";
+        std::vector<CIFAR10Image> dataset = load_cifar10_bin(data_path.c_str());
+        if (!dataset.empty()) {
+            combined_dataset.insert(combined_dataset.end(), dataset.begin(), dataset.end());
+        } else {
+            std::cerr << "Failed to load dataset from " << data_path << std::endl;
+        }
+    }
+    std::cout << "Total number of images in the combined dataset: " << combined_dataset.size() << std::endl;
+
+    // Preprocess the dataset (same as before)
+    std::vector<cv::Mat> images;
+    std::vector<int> labels;
+    for (const auto& item : combined_dataset) {
+        images.push_back(preprocess(item.image));
+        labels.push_back(item.label);
+    }
+
+    // Initialize CUDA Neural Network
+    std::vector<int> layer_sizes = {3072, 128, 64, 10};
+    CudaNeuralNetwork nn(layer_sizes);
+
+    // Allocate GPU memory
+    float *d_inputs, *d_targets;
+    int *d_labels;
+    cudaMalloc(&d_inputs, BATCH_SIZE * 3072 * sizeof(float));
+    cudaMalloc(&d_targets, BATCH_SIZE * 10 * sizeof(float));
+    cudaMalloc(&d_labels, BATCH_SIZE * sizeof(int));
+
+    // Training loop
+    for (int epoch = 0; epoch < NUM_EPOCHS; ++epoch) {
+        int num_correct = 0;
+
+        for (size_t start = 0; start < combined_dataset.size(); start += BATCH_SIZE) {
+            size_t end = std::min(start + BATCH_SIZE, combined_dataset.size());
+            size_t current_batch_size = end - start;
+
+            // Prepare batch data
+            std::vector<float> batch_inputs;
+            std::vector<int> batch_labels;
+            for (size_t i = start; i < end; ++i) {
+                const auto& item = combined_dataset[i];
+                std::vector<float> input(item.image.total());
+                std::memcpy(input.data(), item.image.ptr<float>(), item.image.total() * sizeof(float));
+                batch_inputs.insert(batch_inputs.end(), input.begin(), input.end());
+                batch_labels.push_back(item.label);
+            }
+
+            // Copy data to GPU
+            cudaMemcpy(d_inputs, batch_inputs.data(), current_batch_size * 3072 * sizeof(float), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_labels, batch_labels.data(), current_batch_size * sizeof(int), cudaMemcpyHostToDevice);
+
+            // One-hot encode labels on GPU
+            dim3 block_size(256);
+            dim3 num_blocks((current_batch_size + block_size.x - 1) / block_size.x);
+            oneHotEncode<<<num_blocks, block_size>>>(d_targets, d_labels, 10, current_batch_size);
+
+            // Forward and backward pass
+            nn.forward(d_inputs, current_batch_size);
+            nn.backward(d_inputs, d_targets, LEARNING_RATE, current_batch_size);
+
+            // Compute accuracy (you might want to do this less frequently for performance)
+            std::vector<float> output(current_batch_size * 10);
+            cudaMemcpy(output.data(), nn.getOutput(), current_batch_size * 10 * sizeof(float), cudaMemcpyDeviceToHost);
+            for (size_t i = 0; i < current_batch_size; ++i) {
+                int predicted_label = std::max_element(output.begin() + i*10, output.begin() + (i+1)*10) - (output.begin() + i*10);
+                if (predicted_label == batch_labels[i]) {
+                    num_correct++;
+                }
+            }
+        }
+
+        std::cout << "Epoch " << epoch << ": Accuracy = " << (num_correct / static_cast<float>(combined_dataset.size())) << std::endl;
+    }
+
+    // Testing (similar to training, but without backward pass)
+    std::vector<CIFAR10Image> testset = load_cifar10_bin(TEST_PATH);
+    int num_correct_test = 0;
+
+    for (size_t start = 0; start < testset.size(); start += BATCH_SIZE) {
+        size_t end = std::min(start + BATCH_SIZE, testset.size());
+        size_t current_batch_size = end - start;
+
+        std::vector<float> batch_inputs;
+        std::vector<int> batch_labels;
+        for (size_t i = start; i < end; ++i) {
+            const auto& item = testset[i];
+            cv::Mat preprocessed = preprocess(item.image);
+            std::vector<float> input(preprocessed.total());
+            std::memcpy(input.data(), preprocessed.ptr<float>(), preprocessed.total() * sizeof(float));
+            batch_inputs.insert(batch_inputs.end(), input.begin(), input.end());
+            batch_labels.push_back(item.label);
+        }
+
+        cudaMemcpy(d_inputs, batch_inputs.data(), current_batch_size * 3072 * sizeof(float), cudaMemcpyHostToDevice);
+
+        nn.forward(d_inputs, current_batch_size);
+
+        std::vector<float> output(current_batch_size * 10);
+        cudaMemcpy(output.data(), nn.getOutput(), current_batch_size * 10 * sizeof(float), cudaMemcpyDeviceToHost);
+
+        for (size_t i = 0; i < current_batch_size; ++i) {
+            int predicted_label = std::max_element(output.begin() + i*10, output.begin() + (i+1)*10) - (output.begin() + i*10);
+            if (predicted_label == batch_labels[i]) {
+                num_correct_test++;
+            }
+        }
+    }
+
+    std::cout << "Test Accuracy = " << (num_correct_test / static_cast<float>(testset.size())) << std::endl;
+
+    // Clean up
+    cudaFree(d_inputs);
+    cudaFree(d_targets);
+    cudaFree(d_labels);
+
+    return 0;
+}
